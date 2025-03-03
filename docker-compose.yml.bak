@@ -1,0 +1,100 @@
+version: '3'
+services:
+   bitcoind:
+     image: lncm/bitcoind:v25.0
+     container_name: bitcoind
+   environment:
+    - BITCOIN_NETWORK=regtest
+    - BITCOIN_OPTS=-server=1 -rpcbind=0.0.0.0 -rpcallowip=0.0.0.0/0 -rpcuser=bitcoinuser -rpcpassword=bitcoinpassword -zmqpubrawblock=tcp://0.0.0.0:28332 -zmqpubrawtx=tcp://0.0.0.0:28333 -regtest=1
+  ports:
+    - "18443:18443" # RPC port
+    - "28332:28332" # ZMQ blocks
+    - "28333:28333" # ZMQ transactions
+  volumes:
+    - ./bitcoin-data:/root/.bitcoin
+  networks:
+    - lightning-test
+
+  lnd-alice:
+    image: lightninglabs/lnd:v0.17.0-beta
+    container_name: lnd-alice
+    depends_on:
+      - bitcoind
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        mkdir -p /root/.lnd
+        cat > /root/.lnd/lnd.conf << EOL
+        [Application Options]
+        debuglevel=info
+        maxpendingchannels=10
+        restlisten=0.0.0.0:8080
+        rpclisten=0.0.0.0:10009
+        tlsextraip=0.0.0.0
+        tlsextradomain=lnd-alice
+        alias=alice
+
+        [Bitcoin]
+        bitcoin.active=true
+        bitcoin.regtest=true
+        bitcoin.node=bitcoind
+
+        [Bitcoind]
+        bitcoind.rpchost=bitcoind
+        bitcoind.rpcuser=bitcoinuser
+        bitcoind.rpcpass=bitcoinpassword
+        bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+        bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+        EOL
+        lnd
+    ports:
+      - "10001:10009" # gRPC
+      - "8001:8080"   # REST
+    volumes:
+      - ./lnd-alice-data:/root/.lnd
+    networks:
+      - lightning-test
+
+  lnd-bob:
+    image: lightninglabs/lnd:v0.17.0-beta
+    container_name: lnd-bob
+    depends_on:
+      - bitcoind
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        mkdir -p /root/.lnd
+        cat > /root/.lnd/lnd.conf << EOL
+        [Application Options]
+        debuglevel=info
+        maxpendingchannels=10
+        restlisten=0.0.0.0:8080
+        rpclisten=0.0.0.0:10009
+        tlsextraip=0.0.0.0
+        tlsextradomain=lnd-bob
+        alias=bob
+
+        [Bitcoin]
+        bitcoin.active=true
+        bitcoin.regtest=true
+        bitcoin.node=bitcoind
+
+        [Bitcoind]
+        bitcoind.rpchost=bitcoind
+        bitcoind.rpcuser=bitcoinuser
+        bitcoind.rpcpass=bitcoinpassword
+        bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+        bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+        EOL
+        lnd
+    ports:
+      - "10002:10009" # gRPC
+      - "8002:8080"   # REST
+    volumes:
+      - ./lnd-bob-data:/root/.lnd
+    networks:
+      - lightning-test
+
+networks:
+  lightning-test:
+    driver: bridge
