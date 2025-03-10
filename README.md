@@ -115,20 +115,21 @@ ML models can send rebalancing suggestions in this format:
 
 1. Start the network:
 
-   ```bash
-   docker-compose up -d
-   ```
+```bash
+docker-compose up -d
+```
 
 2. Initialize the network:
 
-   ```bash
-   sudo ./setup-nodes.sh
-   ```
+```bash
+sudo ./setup-nodes.sh
+```
 
 3. If needed, unlock the wallets:
-   ```bash
-   sudo ./unlock-wallets.sh
-   ```
+
+```bash
+sudo ./unlock-wallets.sh
+```
 
 ### Complete Workflow with Lightning Lens
 
