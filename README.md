@@ -1,15 +1,25 @@
-# Lightning Network Testnet
+# Under Construction
 
-A Docker-based Lightning Network testnet for development and testing.
+# Lightning Network Simulation 🚀⚡
+
+A Docker-based Lightning Network testnet simulation environment for training and testing AI-powered liquidity optimization models.
+
+[![AI Analysis](https://img.shields.io/badge/AI_Analysis-Lightning_Lens-blue)](https://github.com/rasta-dave/lightning-lens)
+
+This project provides the simulation environment for the [Lightning Lens](https://github.com/rasta-dave/lightning-lens) AI analysis tool.
+
+## Project Ecosystem
+
+This repository contains the Lightning Network simulation environment. For the complete system:
+
+- **Current Repository**: Provides the Lightning Network simulation environment with Docker-based nodes and realistic payment patterns.
+- **[Lightning Lens](https://github.com/rasta-dave/lightning-lens)**: The companion repository that contains the machine learning model that analyzes data from this simulation and provides rebalancing recommendations.
+
+Both repositories are designed to work together to create a complete Lightning Network optimization system.
 
 ## Overview
 
-This project sets up a local Lightning Network testnet with:
-
-- 1 Bitcoin node (regtest mode)
-- 5 Lightning Network nodes (Alice, Bob, Carol, Dave, Eve)
-- Automated channel setup and funding
-- Simulation tools for testing and analysis
+Lightning Network Simulation is a comprehensive testing environment that creates a realistic Lightning Network with multiple nodes, channels, and payment patterns. It generates transaction data that can be used to train machine learning models for optimizing channel liquidity and improving payment success rates.
 
 ## Getting Started
 
@@ -120,15 +130,41 @@ ML models can send rebalancing suggestions in this format:
    sudo ./unlock-wallets.sh
    ```
 
-## Testing and Simulation
+### Complete Workflow with Lightning Lens
 
-### Basic Testing
-
-Run the basic test script to verify node connectivity:
+To run the complete system with Lightning Lens:
 
 ```bash
-sudo ./test-lightning.sh
+# ======= Inside of the Lightning Network Simulation directory =======
+
+# 1. Start the WebSocket server (simulation side)
+python scripts/websocket_server.py
+
+# ======= Inside of the LightningLens directory =======
+
+# 2. Start the HTTP server (receives data, serves predictions)
+python src/scripts/http_server.py
+
+# 3. Start the WebSocket client (connects to simulation)
+python src/scripts/websocket_client.py
+
+# 4. Start the adapter proxy (transforms data between systems)
+python scripts/adapter_proxy.py
+
+# ======= Inside of the Lightning Network Simulation directory =======
+# 5. Start the simulation
+python scripts/simulate_network.py
 ```
+
+Let the simulation run for at least 10 minutes to collect sufficient data. The components work together:
+
+1. The **simulation** generates Lightning Network transactions and channel states
+2. The **WebSocket server** broadcasts this data
+3. The **WebSocket client** receives the data from the simulation
+4. The **adapter proxy** transforms the data into the format needed by the model
+5. The **HTTP server** stores the data and will later serve predictions
+
+## Using the Simulation
 
 ### Channel Rebalancing
 
@@ -174,13 +210,6 @@ If you're developing an ML model to optimize channel liquidity:
 
 ### Cleanup and Reset
 
-The cleanup script allows you to reset your Lightning Network testnet to a clean state. Use it when:
-
-- You want to start fresh with new channels and balances
-- You encounter issues with channel states or node connectivity
-- You've completed a simulation and want to reset for a new experiment
-- Your channels have become too imbalanced for effective testing
-
 To reset the network:
 
 ```bash
@@ -201,33 +230,6 @@ After cleanup, you'll need to run the setup process again:
 ```bash
 docker-compose up -d
 sudo ./setup-nodes.sh
-```
-
-## Data Analysis
-
-The simulation generates a CSV file (`lightning_simulation_data.csv`) with detailed transaction data, including:
-
-- Timestamps
-- Sender and receiver nodes
-- Payment amounts and fees
-- Success/failure status
-- Route information
-- Transaction duration
-
-This data can be used for:
-
-- Analyzing payment patterns
-- Optimizing channel liquidity
-- Training AI models for routing optimization
-- Visualizing network activity
-
-### Data Persistence
-
-Simulation data is stored in the CSV file and is not affected by the cleanup script. If you want to preserve multiple simulation runs, consider renaming or moving the CSV file before running a new simulation:
-
-```bash
-# Save simulation results before cleanup
-mv lightning_simulation_data.csv simulation_run1_$(date +%Y%m%d).csv
 ```
 
 ## Network Structure
@@ -272,4 +274,4 @@ If you encounter issues with your Lightning Network testnet:
 
 ## License
 
-[Your License Here]
+This project is licensed under the MIT License

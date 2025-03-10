@@ -43,36 +43,63 @@ async def broadcast_update(update):
 
 async def handle_message(websocket, message):
     """Handle incoming messages"""
-    data = json.loads(message)
-    
-    if data["type"] == "channel_update":
-        network_state["channels"] = data["channels"]
-        network_state["last_update"] = datetime.now().isoformat()
-        # Broadcast to all clients
-        await broadcast_update({
-            "type": "channel_update",
-            "data": data["channels"]
-        })
-    
-    elif data["type"] == "transaction":
-        network_state["transactions"].append(data["transaction"])
-        # Keep only the last 100 transactions
-        if len(network_state["transactions"]) > 100:
-            network_state["transactions"] = network_state["transactions"][-100:]
-        # Broadcast to all clients
-        await broadcast_update({
-            "type": "transaction",
-            "data": data["transaction"]
-        })
-    
-    elif data["type"] == "rebalance_suggestion":
-        # Broadcast suggestion to all clients
-        await broadcast_update({
-            "type": "rebalance_suggestion",
-            "data": data["suggestion"]
-        })
+    try:
+        data = json.loads(message)
+        
+        # Check if we have a valid type
+        if "type" not in data:
+            print(f"Received message without type: {message[:100]}...")
+            return
+            
+        if data["type"] == "channel_update":
+            # Update to handle the new data format
+            if "channels" in data:
+                network_state["channels"] = data["channels"]
+            elif "data" in data:
+                network_state["channels"] = data["data"]
+            network_state["last_update"] = datetime.now().isoformat()
+            # Broadcast to all clients
+            await broadcast_update({
+                "type": "channel_update",
+                "data": network_state["channels"]
+            })
+        
+        elif data["type"] == "transaction":
+            # Update to handle the new data format
+            transaction_data = data.get("transaction", data.get("data", {}))
+            network_state["transactions"].append(transaction_data)
+            # Keep only the last 100 transactions
+            if len(network_state["transactions"]) > 100:
+                network_state["transactions"] = network_state["transactions"][-100:]
+            # Broadcast to all clients
+            await broadcast_update({
+                "type": "transaction",
+                "data": transaction_data
+            })
+        
+        elif data["type"] == "request_suggestions":
+            # Handle requests for rebalancing suggestions
+            # This is where your ML model would generate suggestions
+            await websocket.send(json.dumps({
+                "type": "rebalance_suggestions",
+                "suggestions": []  # Empty list for now, would be filled by ML model
+            }))
+        
+        elif data["type"] == "rebalance_suggestion":
+            # Broadcast suggestion to all clients
+            suggestion_data = data.get("suggestion", data.get("data", {}))
+            await broadcast_update({
+                "type": "rebalance_suggestion",
+                "data": suggestion_data
+            })
 
-async def server(websocket, path):
+    except json.JSONDecodeError:
+        print(f"Received invalid JSON: {message[:100]}...")
+    except Exception as e:
+        print(f"Error handling message: {str(e)}")
+        print(f"Message was: {message[:100]}...")
+
+async def server(websocket):
     """Handle WebSocket connections"""
     await register(websocket)
     try:

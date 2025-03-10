@@ -16,6 +16,7 @@ import signal
 import sys
 from datetime import datetime
 import requests
+import traceback
 
 # Configuration
 NODES = ["lnd-alice", "lnd-bob", "lnd-carol", "lnd-dave", "lnd-eve"]
@@ -59,19 +60,11 @@ PAYMENT_DESCRIPTIONS = [
 
 # CSV headers
 CSV_HEADERS = [
-    "timestamp",
-    "type",              # New field: "payment" or "rebalance"
-    "sender",
-    "receiver", 
-    "amount",
-    "fee",
-    "route_length",
-    "success",
-    "payment_hash",
-    "description",
-    "duration_ms",
-    "channel_before",    # New field: channel state before operation
-    "channel_after"      # New field: channel state after operation
+    "timestamp", "type", "sender", "receiver", "amount", "fee", 
+    "route_length", "success", "payment_hash", "description", 
+    "duration_ms", "channel_before", "channel_after",
+    "sender_balance_before", "sender_balance_after",
+    "receiver_balance_before", "receiver_balance_after"
 ]
 
 # Global variables for statistics
@@ -90,20 +83,127 @@ stats = {
     "auto_rebalance_successes": 0
 }
 
-def run_command(cmd):
-    """Run a shell command and return the output"""
+def run_command(cmd, timeout=30):
+    """Run a command and return the output"""
     try:
-        # Add timeout to prevent hanging
-        result = subprocess.run(cmd, shell=True, check=True, 
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=30)  # 30 second timeout
-        return result.stdout.decode('utf-8')
+        # Use subprocess with timeout
+        result = subprocess.run(
+            cmd, 
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout  # Add timeout parameter
+        )
+        
+        # Check for wallet locked error
+        if result.returncode != 0:
+            if "wallet locked" in result.stderr:
+                # Extract node name from command
+                if "docker exec" in cmd:
+                    node_name = cmd.split("docker exec ")[1].split(" ")[0]
+                    print(f"🔒 Wallet locked detected for {node_name}. Attempting to unlock...")
+                    
+                    # Try to unlock the wallet
+                    if unlock_wallet(node_name):
+                        # Retry the command after successful unlock
+                        print(f"Retrying command after wallet unlock...")
+                        retry_result = subprocess.run(
+                            cmd,
+                            shell=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=timeout
+                        )
+                        
+                        if retry_result.returncode == 0:
+                            return retry_result.stdout.strip()
+                        else:
+                            print(f"Command failed even after wallet unlock: {cmd}")
+                            print(f"Error: {retry_result.stderr}")
+                            return None
+            
+            # Handle other errors
+            print(f"Command failed: {cmd}")
+            print(f"Error: {result.stderr}")
+            return None
+        
+        return result.stdout.strip()
     except subprocess.TimeoutExpired:
         print(f"Command timed out: {cmd}")
+        # Try to restart the problematic node
+        if "lnd-" in cmd and "lncli" in cmd:
+            node_name = cmd.split("docker exec ")[1].split(" ")[0]
+            print(f"⚠️ Node {node_name} appears to be unresponsive. Attempting to recover...")
+            
+            try:
+                # Check if wallet is locked
+                unlock_check = subprocess.run(
+                    f"docker exec {node_name} lncli --network=regtest getinfo",
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5
+                )
+                
+                if "wallet locked" in unlock_check.stderr.lower() or "wallet not found" in unlock_check.stderr.lower():
+                    print(f"🔒 Wallet appears to be locked on {node_name}.")
+                    # Try to unlock the wallet using our new function
+                    if unlock_wallet(node_name):
+                        # Try the command again
+                        print(f"Retrying command...")
+                        retry_result = subprocess.run(
+                            cmd,
+                            shell=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=timeout
+                        )
+                        
+                        if retry_result.returncode == 0:
+                            print(f"✅ Command succeeded after wallet unlock")
+                            return retry_result.stdout.strip()
+                        else:
+                            print(f"❌ Command still failing after wallet unlock: {retry_result.stderr}")
+                            return None
+                else:
+                    # Just restart the node
+                    print(f"Restarting {node_name}...")
+                    subprocess.run(f"docker restart {node_name}", shell=True, timeout=30)
+                    print(f"Waiting for {node_name} to initialize...")
+                    time.sleep(15)
+                    
+                    # Try to unlock the wallet after restart
+                    unlock_wallet(node_name)
+                    
+                    # Try the command again
+                    print(f"Retrying command...")
+                    retry_result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout
+                    )
+                    
+                    if retry_result.returncode == 0:
+                        print(f"✅ Command succeeded after node restart")
+                        return retry_result.stdout.strip()
+                    else:
+                        print(f"❌ Command still failing after restart: {retry_result.stderr}")
+                        return None
+                
+            except Exception as e:
+                print(f"❌ Error during recovery attempt: {e}")
+                return None
+        
         return None
-    except subprocess.CalledProcessError as e:
-        print(f"Command failed: {e}")
-        print(f"Error output: {e.stderr.decode('utf-8')}")
+    except Exception as e:
+        print(f"Error executing command: {e}")
         return None
 
 def get_node_info(node):
@@ -119,8 +219,14 @@ def get_node_channels(node):
     cmd = f"docker exec {node} lncli --network=regtest listchannels"
     output = run_command(cmd)
     if output:
-        return json.loads(output)
-    return None
+        try:
+            # Parse the JSON output
+            return json.loads(output)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing channel data for {node}: {e}")
+            print(f"Raw output: {output[:100]}...")  # Print first 100 chars of output
+            return {"channels": []}  # Return empty channels list instead of None
+    return {"channels": []}  # Return empty channels list instead of None
 
 def create_invoice(node, amount, memo):
     """Create an invoice on a node"""
@@ -258,17 +364,43 @@ def check_payment_feasibility(sender, receiver, amount):
     
     return False
 
-def notify_ml_model(event_type, data):
-    """Send data to ML model via REST API"""
+def notify_websocket(event_type, data):
+    """Send data to WebSocket server for ML model consumption"""
     try:
-        response = requests.post('http://localhost:5000/api/update', json={
-            'event_type': event_type,
-            'timestamp': datetime.now().isoformat(),
-            **data
-        }, timeout=1)  # Short timeout to avoid blocking simulation
-        return response.status_code == 200
+        import websockets
+        import asyncio
+        
+        async def send_message():
+            uri = "ws://localhost:6789"
+            async with websockets.connect(uri) as websocket:
+                # Make sure data is a dictionary, not a string
+                if isinstance(data, str):
+                    try:
+                        # Try to parse it as JSON
+                        data_dict = json.loads(data)
+                    except json.JSONDecodeError:
+                        # If it's not valid JSON, wrap it in a dictionary
+                        data_dict = {"message": data}
+                else:
+                    # Already a dictionary or other object
+                    data_dict = data
+                
+                message = {
+                    "type": event_type,
+                    "data": data_dict
+                }
+                await websocket.send(json.dumps(message))
+                # Wait briefly for acknowledgment
+                await asyncio.sleep(0.1)
+        
+        # Run the async function in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(send_message())
+        loop.close()
+        return True
     except Exception as e:
-        print(f"Failed to notify ML model: {e}")
+        print(f"Failed to notify WebSocket server: {e}")
         return False
 
 def simulate_transaction():
@@ -327,83 +459,19 @@ def simulate_transaction():
     
     # Process result
     success = False
-    fee = 0
-    payment_hash = invoice_result.get("r_hash", "unknown")
-    route_length = 1  # Default for direct payments
+    payment_error = None
     
-    if payment_result:
-        if "payment_error" in payment_result and payment_result["payment_error"]:
-            stats["consecutive_failures"] += 1
-            print(f"❌ Payment failed: {payment_result['payment_error']}")
-            print(f"⚠️ Consecutive failures: {stats['consecutive_failures']}/{FAILURE_THRESHOLD}")
-            
-            # Add message about pending rebalancing with clearer instructions
-            if stats["consecutive_failures"] >= FAILURE_THRESHOLD:
-                print(f"🔄 PENDING: Auto-recovery will begin shortly")
-                print(f"⏱️ The system will wait {AUTO_RECOVERY_DELAY} seconds before rebalancing")
-            elif stats["consecutive_failures"] > 0:
-                remaining = FAILURE_THRESHOLD - stats["consecutive_failures"]
-                print(f"⚠️ Auto-recovery will trigger after {remaining} more failed payment(s)")
-        elif "status" in payment_result and payment_result["status"] == "SUCCEEDED":
-            success = True
-            stats["consecutive_failures"] = 0  # Reset consecutive failures
-            print(f"✅ Payment succeeded!")
-            
-            # Extract fee and route information
-            if "payment_route" in payment_result:
-                route = payment_result["payment_route"]
-                fee = route.get("total_fees", "0")
-                hops = route.get("hops", [])
-                route_length = len(hops)
-                
-                # Show route if it's multi-hop
-                if route_length > 1:
-                    hop_str = " -> ".join([hop.get("pub_key", "")[:6] + "..." for hop in hops])
-                    print(f"Route: {hop_str} ({route_length} hops)")
-                    print(f"Fee: {fee} sats")
-            elif "fee" in payment_result:
-                fee = payment_result["fee"]
-                print(f"Fee: {fee} sats")
-        else:
-            stats["consecutive_failures"] += 1
-            print(f"❌ Payment status: {payment_result.get('status', 'unknown')}")
-            print(f"⚠️ Consecutive failures: {stats['consecutive_failures']}/{FAILURE_THRESHOLD}")
-            
-            # Add message about pending rebalancing with clearer instructions
-            if stats["consecutive_failures"] >= FAILURE_THRESHOLD:
-                print(f"🔄 PENDING: Auto-recovery will begin shortly")
-                print(f"⏱️ The system will wait {AUTO_RECOVERY_DELAY} seconds before rebalancing")
-            elif stats["consecutive_failures"] > 0:
-                remaining = FAILURE_THRESHOLD - stats["consecutive_failures"]
-                print(f"⚠️ Auto-recovery will trigger after {remaining} more failed payment(s)")
-    else:
-        stats["consecutive_failures"] += 1
-        print("❌ No payment result returned")
-        print(f"⚠️ Consecutive failures: {stats['consecutive_failures']}/{FAILURE_THRESHOLD}")
-        
-        # Add message about pending rebalancing with clearer instructions
-        if stats["consecutive_failures"] >= FAILURE_THRESHOLD:
-            print(f"🔄 PENDING: Auto-recovery will begin shortly")
-            print(f"⏱️ The system will wait {AUTO_RECOVERY_DELAY} seconds before rebalancing")
-        elif stats["consecutive_failures"] > 0:
-            remaining = FAILURE_THRESHOLD - stats["consecutive_failures"]
-            print(f"⚠️ Auto-recovery will trigger after {remaining} more failed payment(s)")
-    
-    # Update statistics
-    stats["total_payments"] += 1
-    if success:
-        stats["successful_payments"] += 1
-        stats["total_amount"] += amount
-        try:
-            stats["total_fees"] += int(fee)
-        except (ValueError, TypeError):
-            pass
-        
-        # Update node statistics
-        stats["node_payments"][sender]["sent"] += amount
-        stats["node_payments"][receiver]["received"] += amount
-    else:
+    if "payment_error" in payment_result and payment_result["payment_error"]:
+        payment_error = payment_result["payment_error"]
+        print(f"❌ Payment status: failed")
+        print(f"   Error: {payment_error}")
         stats["failed_payments"] += 1
+        stats["consecutive_failures"] += 1
+    else:
+        success = True
+        print(f"✅ Payment status: success")
+        stats["successful_payments"] += 1
+        stats["consecutive_failures"] = 0
     
     # Capture channel state after transaction
     sender_channels_after = get_node_channels(sender)
@@ -413,8 +481,22 @@ def simulate_transaction():
         "receiver": extract_channel_summary(receiver_channels_after)
     }
     
-    # Notify ML model about the transaction
-    notify_ml_model('transaction', {
+    # Send transaction data to HTTP API
+    send_transaction_data(sender, receiver, amount, success)
+    
+    # Send channel state data to HTTP API for each channel
+    for node, channels_data in [(sender, sender_channels_after), (receiver, receiver_channels_after)]:
+        if isinstance(channels_data, dict) and "channels" in channels_data:
+            for channel in channels_data["channels"]:
+                if isinstance(channel, dict):
+                    remote_pubkey = channel.get("remote_pubkey", "")
+                    capacity = int(channel.get("capacity", 0))
+                    local_balance = int(channel.get("local_balance", 0))
+                    if remote_pubkey and capacity > 0:
+                        send_channel_state(node, remote_pubkey, capacity, local_balance)
+    
+    # Notify WebSocket server about the transaction
+    notify_websocket('transaction', {
         'transaction': {
             'sender': sender,
             'receiver': receiver,
@@ -435,10 +517,10 @@ def simulate_transaction():
         "sender": sender,
         "receiver": receiver,
         "amount": amount,
-        "fee": fee,
-        "route_length": route_length,
+        "fee": 0,
+        "route_length": 1,
         "success": success,
-        "payment_hash": payment_hash,
+        "payment_hash": "",
         "description": description,
         "duration_ms": duration_ms,
         "channel_before": json.dumps(channel_before),
@@ -447,18 +529,29 @@ def simulate_transaction():
 
 # Helper function to extract channel summary
 def extract_channel_summary(channels_data):
-    """Extract a summary of channel balances"""
-    if not channels_data or "channels" not in channels_data:
-        return {}
+    """Extract a summary of channel data for logging"""
+    summary = {}
     
-    summary = []
-    for channel in channels_data["channels"]:
-        summary.append({
-            "remote_pubkey": channel.get("remote_pubkey", "")[:10],
-            "capacity": channel.get("capacity", 0),
-            "local_balance": channel.get("local_balance", 0),
-            "remote_balance": channel.get("remote_balance", 0)
-        })
+    if not isinstance(channels_data, dict):
+        return summary
+        
+    channels = channels_data.get("channels", [])
+    for channel in channels:
+        if not isinstance(channel, dict):
+            continue
+            
+        remote_pubkey = channel.get("remote_pubkey", "")
+        if not remote_pubkey:
+            continue
+            
+        channel_id = f"{remote_pubkey[:8]}"
+        summary[channel_id] = {
+            "remote_pubkey": remote_pubkey,
+            "capacity": int(channel.get("capacity", 0)),
+            "local_balance": int(channel.get("local_balance", 0)),
+            "remote_balance": int(channel.get("remote_balance", 0))
+        }
+    
     return summary
 
 def rebalance_channels():
@@ -561,26 +654,81 @@ def validate_transaction_data(transaction):
     return transaction
 
 def log_transaction(transaction, csv_writer):
-    """Log transaction data to CSV file"""
-    # Validate data before writing
-    transaction = validate_transaction_data(transaction)
+    """Log a transaction to the CSV file and notify WebSocket server"""
+    # Extract transaction data
     
-    # Write the row
-    csv_writer.writerow([
-        transaction.get("timestamp", ""),
-        transaction.get("type", "payment"),
-        transaction.get("sender", ""),
-        transaction.get("receiver", ""),
-        transaction.get("amount", 0),
-        transaction.get("fee", 0),
-        transaction.get("route_length", 1),
-        transaction.get("success", False),
-        transaction.get("payment_hash", ""),
-        transaction.get("description", ""),
-        transaction.get("duration_ms", 0),
-        transaction.get("channel_before", ""),
-        transaction.get("channel_after", "")
-    ])
+    # Calculate balance summaries
+    sender_balance_before = 0
+    sender_balance_after = 0
+    receiver_balance_before = 0
+    receiver_balance_after = 0
+    
+    # Safely extract channel data
+    if isinstance(transaction.get("channel_before"), dict):
+        sender_data = transaction.get("channel_before", {}).get("sender", {})
+        if isinstance(sender_data, dict):
+            sender_balance_before = sum_channel_balances(sender_data)
+            
+        receiver_data = transaction.get("channel_before", {}).get("receiver", {})
+        if isinstance(receiver_data, dict):
+            receiver_balance_before = sum_channel_balances(receiver_data)
+    
+    if isinstance(transaction.get("channel_after"), dict):
+        sender_data = transaction.get("channel_after", {}).get("sender", {})
+        if isinstance(sender_data, dict):
+            sender_balance_after = sum_channel_balances(sender_data)
+            
+        receiver_data = transaction.get("channel_after", {}).get("receiver", {})
+        if isinstance(receiver_data, dict):
+            receiver_balance_after = sum_channel_balances(receiver_data)
+    
+    # Create row data
+    row = [
+        transaction["timestamp"],
+        transaction["type"],
+        transaction["sender"],
+        transaction["receiver"],
+        transaction["amount"],
+        transaction["fee"],
+        transaction["route_length"],
+        transaction["success"],
+        transaction["payment_hash"],
+        transaction["description"],
+        transaction["duration_ms"],
+        json.dumps(transaction.get("channel_before", {})),
+        json.dumps(transaction.get("channel_after", {})),
+        sender_balance_before,
+        sender_balance_after,
+        receiver_balance_before,
+        receiver_balance_after
+    ]
+    
+    # Write to CSV
+    csv_writer.writerow(row)
+    
+    # Notify WebSocket server
+    try:
+        notify_websocket("transaction", {
+            "timestamp": transaction["timestamp"],
+            "sender": transaction["sender"],
+            "receiver": transaction["receiver"],
+            "amount": transaction["amount"],
+            "success": transaction["success"],
+            "description": transaction["description"]
+        })
+    except Exception as e:
+        print(f"Error notifying WebSocket server: {e}")
+        
+    # Send transaction data to HTTP API
+    try:
+        send_transaction_data(
+            transaction["sender"],
+            transaction["receiver"],
+            transaction["amount"],
+            transaction["success"]
+        )
+    except Exception as e:
+        print(f"Error sending transaction data to HTTP API: {e}")
 
 def visualize_channel(local_pct, remote_pct):
     """Create a visual representation of channel balance"""
@@ -667,55 +815,73 @@ def print_statistics():
     print("="*70)
 
 def check_channel_balances():
-    """Check and display current channel balances"""
-    print("\n" + "="*70)
-    print("CURRENT CHANNEL BALANCES")
-    print("="*70)
+    """Check and display channel balances for all nodes"""
+    print("\nCHANNEL BALANCES:")
+    print("-----------------")
+    
+    all_channels = {}
     
     for node in NODES:
-        print(f"\n{node} Channels:")
-        print("-"*70)
-        
-        channels = get_node_channels(node)
-        if channels and "channels" in channels:
-            for i, channel in enumerate(channels["channels"]):
-                remote_pubkey = channel.get("remote_pubkey", "Unknown")[:10] + "..."
-                capacity = channel.get("capacity", 0)
-                local_balance = channel.get("local_balance", 0)
-                remote_balance = channel.get("remote_balance", 0)
+        channels_data = get_node_channels(node)
+        if not isinstance(channels_data, dict):
+            print(f"Warning: Invalid channel data for {node}")
+            continue
+            
+        channels = channels_data.get("channels", [])
+        if not channels:
+            print(f"No channels found for {node}")
+            continue
+            
+        node_channels = []
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
                 
-                # Convert to integers for calculation
-                try:
-                    capacity_int = int(capacity)
-                    local_balance_int = int(local_balance)
-                    remote_balance_int = int(remote_balance)
-                except (ValueError, TypeError):
-                    # If conversion fails, use 0 for percentage calculation
-                    capacity_int = 1  # Avoid division by zero
-                    local_balance_int = 0
-                    remote_balance_int = 0
-                
-                # Calculate percentages
+            remote_pubkey = channel.get("remote_pubkey", "")
+            capacity = channel.get("capacity", "0")
+            local_balance = channel.get("local_balance", "0")
+            remote_balance = channel.get("remote_balance", "0")
+            
+            # Calculate percentages
+            capacity_int = int(capacity)
+            local_balance_int = int(local_balance)
+            if capacity_int > 0:
                 local_pct = local_balance_int / capacity_int * 100
-                remote_pct = remote_balance_int / capacity_int * 100
-                
-                # Find remote node name
-                remote_node = "Unknown"
-                for n in NODES:
-                    if n == node:
-                        continue
-                    info = get_node_info(n)
-                    if info and info.get("identity_pubkey", "").startswith(remote_pubkey[:10]):
-                        remote_node = n
-                        break
-                
-                print(f"Channel {i+1} with {remote_node}:")
-                print(f"  Capacity: {capacity} sats")
-                print(f"  {visualize_channel(local_pct, remote_pct)}")
-        else:
-            print("  No channels found or error retrieving channel data")
+                remote_pct = int(remote_balance) / capacity_int * 100
+            else:
+                local_pct = 0
+                remote_pct = 0
+            
+            # Find remote node name
+            remote_node = "unknown"
+            for n in NODES:
+                if n == node:
+                    continue
+                n_info = get_node_info(n)
+                if n_info and n_info.get("identity_pubkey") == remote_pubkey:
+                    remote_node = n
+                    break
+            
+            print(f"  {node} <--> {remote_node}: {local_balance}/{capacity} sats ({local_pct:.1f}%)")
+            
+            # Add to node_channels list
+            node_channels.append({
+                "remote_pubkey": remote_pubkey,
+                "capacity": capacity,
+                "local_balance": local_balance,
+                "remote_balance": remote_balance
+            })
+            
+            # Send channel state to HTTP API
+            send_channel_state(node, remote_pubkey, int(capacity), int(local_balance))
+        
+        # Add to all_channels dict
+        all_channels[node] = node_channels
     
-    print("="*70)
+    # Send channel state to WebSocket server
+    notify_websocket("channel_update", all_channels)
+    
+    print("-----------------")
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C to gracefully exit the simulation"""
@@ -727,151 +893,246 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGTERM, signal_handler)
 
 def targeted_rebalance():
-    """Perform targeted rebalancing to fix failing payment paths"""
+    """Perform targeted rebalancing based on channel imbalances"""
     print("\n" + "="*70)
     print("AUTO-RECOVERY REBALANCING")
     print("="*70)
     
-    stats["auto_rebalance_events"] += 1
-    rebalance_success = False
-    
-    # Get all channels and identify the most imbalanced ones
-    imbalanced_channels = []
-    
-    for node in NODES:
-        channels = get_node_channels(node)
-        if not channels or "channels" not in channels:
-            continue
+    try:
+        # Get all channels and calculate imbalance
+        imbalanced_channels = []
+        for node in NODES:
+            channels_data = get_node_channels(node)
             
-        for channel in channels["channels"]:
-            capacity = int(channel.get("capacity", 0))
-            local_balance = int(channel.get("local_balance", 0))
-            remote_pubkey = channel.get("remote_pubkey", "")
-            
-            # Calculate imbalance percentage (0 = balanced, 100 = completely imbalanced)
-            local_pct = local_balance / capacity * 100
-            imbalance = abs(50 - local_pct)
-            
-            # Find remote node name
-            remote_node = "unknown"
-            for n in NODES:
-                if n == node:
+            # Ensure we have valid channel data
+            if not isinstance(channels_data, dict):
+                print(f"Warning: Invalid channel data for {node}")
+                continue
+                
+            channels = channels_data.get("channels", [])
+            if not channels:
+                print(f"No channels found for {node}")
+                continue
+                
+            for channel in channels:
+                # Skip if channel data is invalid
+                if not isinstance(channel, dict):
                     continue
-                info = get_node_info(n)
-                if info and info.get("identity_pubkey", "") == remote_pubkey:
-                    remote_node = n
-                    break
+                    
+                remote_pubkey = channel.get("remote_pubkey", "")
+                capacity = int(channel.get("capacity", 0))
+                local_balance = int(channel.get("local_balance", 0))
+                remote_balance = int(channel.get("remote_balance", 0))
+                
+                # Skip channels with zero capacity
+                if capacity == 0:
+                    continue
+                    
+                # Calculate local percentage
+                local_pct = local_balance / capacity * 100
+                
+                # Find remote node name
+                remote_node = None
+                for n in NODES:
+                    if n == node:
+                        continue
+                    n_info = get_node_info(n)
+                    if n_info and n_info.get("identity_pubkey") == remote_pubkey:
+                        remote_node = n
+                        break
+                
+                # Skip if we couldn't identify the remote node
+                if not remote_node:
+                    continue
+                
+                # Add to imbalanced list if significantly imbalanced
+                if local_pct < 35 or local_pct > 65:
+                    imbalanced_channels.append({
+                        "node": node,
+                        "remote_node": remote_node,
+                        "capacity": capacity,
+                        "local_balance": local_balance,
+                        "remote_balance": remote_balance,
+                        "local_pct": local_pct,
+                        "imbalance": abs(50 - local_pct)  # Distance from balanced (50%)
+                    })
+        
+        # Sort channels by imbalance (most imbalanced first)
+        imbalanced_channels.sort(key=lambda x: x["imbalance"], reverse=True)
+        
+        # Attempt to rebalance the most imbalanced channels
+        rebalance_success = False
+        for channel in imbalanced_channels[:3]:  # Try top 3 most imbalanced
+            node = channel["node"]
+            remote_node = channel["remote_node"]
+            local_pct = channel["local_pct"]
             
-            imbalanced_channels.append({
-                "node": node,
-                "remote_node": remote_node,
-                "local_pct": local_pct,
-                "imbalance": imbalance,
-                "capacity": capacity,
-                "local_balance": local_balance,
-                "remote_pubkey": remote_pubkey
-            })
-    
-    # Sort channels by imbalance (most imbalanced first)
-    imbalanced_channels.sort(key=lambda x: x["imbalance"], reverse=True)
-    
-    # Rebalance the top 3 most imbalanced channels
-    for idx, channel in enumerate(imbalanced_channels[:3]):
-        node = channel["node"]
-        remote_node = channel["remote_node"]
-        local_pct = channel["local_pct"]
-        capacity = channel["capacity"]
-        
-        print(f"Rebalancing {node} <-> {remote_node} (current balance: {local_pct:.1f}% local)")
-        
-        # Determine direction and amount
-        if local_pct > 50:
-            # Node has too much local balance, send to remote
-            sender = node
-            receiver = remote_node
-            target_pct = max(40, local_pct - 20)  # Aim for more balanced, but not completely
-        else:
-            # Node has too little local balance, receive from remote
-            sender = remote_node
-            receiver = node
-            target_pct = min(60, local_pct + 20)  # Aim for more balanced, but not completely
-        
-        # Calculate amount to transfer (percentage of capacity)
-        amount = int(capacity * RECOVERY_REBALANCE_AMOUNT)
-        if amount < 10000:
-            amount = min(10000, int(capacity * 0.1))  # Ensure minimum effective amount
-        
-        print(f"  💸 Transferring {amount} sats from {sender} to {receiver}...")
-        
-        # Capture channel state before rebalancing
-        node_channels_before = get_node_channels(node)
-        remote_channels_before = get_node_channels(remote_node)
-        channel_before = {
-            "sender": extract_channel_summary(node_channels_before),
-            "receiver": extract_channel_summary(remote_channels_before)
-        }
-        
-        # Create invoice for rebalancing
-        invoice_result = create_invoice(receiver, amount, "Auto-recovery rebalance")
-        if not invoice_result:
-            print(f"  ❌ Failed to create invoice on {receiver}")
-            continue
+            # Skip if we don't have valid node names
+            if not node or not remote_node:
+                continue
+                
+            print(f"Rebalancing {node} <-> {remote_node} (current balance: {local_pct:.1f}% local)")
             
-        payment_request = invoice_result.get("payment_request")
-        if not payment_request:
-            print(f"  ❌ No payment request in invoice result")
-            continue
-        
-        # Pay invoice
-        payment_result, _ = pay_invoice(sender, payment_request)
-        
-        if payment_result:
-            if "payment_error" in payment_result and payment_result["payment_error"]:
-                print(f"  ❌ Rebalancing failed: {payment_result['payment_error']}")
-            elif "status" in payment_result and payment_result["status"] == "SUCCEEDED":
-                print(f"  ✅ Rebalancing succeeded!")
-                rebalance_success = True
-                stats["auto_rebalance_successes"] += 1
+            # Determine direction and amount
+            if local_pct < 35:
+                # Local side is low, need to receive funds
+                sender = remote_node
+                receiver = node
+                amount = int(channel["capacity"] * RECOVERY_REBALANCE_AMOUNT)
+                print(f"  💸 Transferring {amount} sats from {sender} to {receiver}...")
             else:
-                print(f"  ❌ Rebalancing failed: {payment_result.get('status', 'unknown')}")
-        else:
-            print(f"  ❌ Rebalancing failed: No payment result returned")
+                # Local side is high, need to send funds
+                sender = node
+                receiver = remote_node
+                amount = int(channel["capacity"] * RECOVERY_REBALANCE_AMOUNT)
+                print(f"  💸 Transferring {amount} sats from {sender} to {receiver}...")
+            
+            # Attempt direct rebalance
+            success = rebalance_channel(sender, receiver, amount)
+            if success:
+                rebalance_success = True
         
-        # Capture channel state after rebalancing
-        node_channels_after = get_node_channels(node)
-        remote_channels_after = get_node_channels(remote_node)
-        channel_after = {
-            "sender": extract_channel_summary(node_channels_after),
-            "receiver": extract_channel_summary(remote_channels_after)
-        }
+        # If direct rebalancing failed, try circular rebalancing
+        if not rebalance_success and len(imbalanced_channels) >= 2:
+            print("\nTrying circular rebalancing strategy...")
+            
+            # Try to find two channels that can be balanced via a circular payment
+            for i in range(min(3, len(imbalanced_channels))):
+                channel1 = imbalanced_channels[i]
+                
+                # Skip if we don't have valid node names
+                if not channel1["node"] or not channel1["remote_node"]:
+                    continue
+                    
+                for j in range(i+1, min(5, len(imbalanced_channels))):
+                    channel2 = imbalanced_channels[j]
+                    
+                    # Skip if we don't have valid node names
+                    if not channel2["node"] or not channel2["remote_node"]:
+                        continue
+                    
+                    # Find a common peer for circular rebalancing
+                    middle_hop = find_common_peer(channel1["node"], channel2["node"])
+                    
+                    if middle_hop:
+                        # Determine amount (smaller of the two imbalances)
+                        amount = min(
+                            int(channel1["capacity"] * RECOVERY_REBALANCE_AMOUNT),
+                            int(channel2["capacity"] * RECOVERY_REBALANCE_AMOUNT)
+                        )
+                        
+                        # Attempt circular rebalance
+                        print(f"  Attempting circular rebalance: {channel1['node']} -> {middle_hop} -> {channel2['node']}")
+                        success = circular_rebalance(channel1["node"], middle_hop, channel2["node"], amount)
+                        if success:
+                            rebalance_success = True
+                            break
+                
+                if rebalance_success:
+                    break
         
-        # Log the rebalancing operation to CSV
-        rebalance_data = {
-            "timestamp": datetime.now().isoformat(),
-            "type": "rebalance",
-            "sender": sender,
-            "receiver": receiver,
-            "amount": amount,
-            "fee": 0,
-            "route_length": 1,
-            "success": rebalance_success,
-            "payment_hash": "",
-            "description": f"Auto-recovery rebalance ({local_pct:.1f}% imbalance)",
-            "duration_ms": 0,
-            "channel_before": json.dumps(channel_before),
-            "channel_after": json.dumps(channel_after)
-        }
-        
-        # Add to CSV file - use a separate with block to ensure proper file handling
-        try:
-            with open(CSV_OUTPUT, 'a', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile)
-                log_transaction(rebalance_data, csv_writer)
-        except Exception as e:
-            print(f"Error logging rebalance data: {e}")
+        print("="*70)
+        return rebalance_success
     
-    print("="*70)
-    return rebalance_success
+    except Exception as e:
+        print(f"Error during rebalancing: {e}")
+        traceback.print_exc()
+        return False
+
+def find_common_peer(node1, node2):
+    """Find a common peer between two nodes for circular rebalancing"""
+    if not node1 or not node2 or node1 == node2:
+        print(f"  ❌ Invalid nodes for finding common peer: {node1}, {node2}")
+        return None
+        
+    try:
+        # Get channels for both nodes
+        node1_channels = get_node_channels(node1)
+        node2_channels = get_node_channels(node2)
+        
+        # Ensure we have valid channel data
+        if not isinstance(node1_channels, dict) or not isinstance(node2_channels, dict):
+            print(f"  ❌ Invalid channel data for nodes")
+            return None
+            
+        # Get peers of node1
+        node1_peers = set()
+        for channel in node1_channels.get("channels", []):
+            if not isinstance(channel, dict):
+                continue
+                
+            remote_pubkey = channel.get("remote_pubkey", "")
+            if not remote_pubkey:
+                continue
+                
+            # Find node name for this pubkey
+            for node in NODES:
+                if node == node1:
+                    continue
+                    
+                node_info = get_node_info(node)
+                if node_info and node_info.get("identity_pubkey") == remote_pubkey:
+                    node1_peers.add(node)
+                    break
+        
+        # Get peers of node2
+        node2_peers = set()
+        for channel in node2_channels.get("channels", []):
+            if not isinstance(channel, dict):
+                continue
+                
+            remote_pubkey = channel.get("remote_pubkey", "")
+            if not remote_pubkey:
+                continue
+                
+            # Find node name for this pubkey
+            for node in NODES:
+                if node == node2:
+                    continue
+                    
+                node_info = get_node_info(node)
+                if node_info and node_info.get("identity_pubkey") == remote_pubkey:
+                    node2_peers.add(node)
+                    break
+        
+        # Find common peers
+        common_peers = node1_peers.intersection(node2_peers)
+        if common_peers:
+            common_peer = next(iter(common_peers))
+            print(f"  ✅ Found common peer: {common_peer}")
+            return common_peer
+            
+        print(f"  ❌ No common peers found between {node1} and {node2}")
+        return None
+    except Exception as e:
+        print(f"  ❌ Error finding common peer: {e}")
+        traceback.print_exc()
+        return None
+
+def circular_rebalance(first_hop, middle_hop, final_hop, amount):
+    """Perform a circular rebalance payment"""
+    try:
+        # Create an invoice on the final hop
+        invoice_cmd = f"docker exec {final_hop} lncli --network=regtest addinvoice --amt={amount}"
+        invoice_result = json.loads(run_command(invoice_cmd))
+        payment_hash = invoice_result.get("r_hash", "")
+        payment_request = invoice_result.get("payment_request", "")
+        
+        # Send payment from first hop through middle hop to final hop
+        payment_cmd = f"docker exec {first_hop} lncli --network=regtest payinvoice --force --amt={amount} {payment_request}"
+        payment_result = json.loads(run_command(payment_cmd))
+        
+        if "payment_error" in payment_result and payment_result["payment_error"]:
+            print(f"  ❌ Circular rebalancing failed: {payment_result['payment_error']}")
+            return False
+        
+        print(f"  ✅ Circular rebalancing successful!")
+        stats["rebalance_operations"] += 1
+        stats["rebalance_successes"] += 1
+        return True
+    except Exception as e:
+        print(f"  ❌ Circular rebalancing error: {e}")
+        return False
 
 def log_channel_snapshot():
     """Log a snapshot of all channel states to CSV"""
@@ -940,20 +1201,332 @@ def show_progress_bar(duration, message):
     print("=" * (bar_length - completed) + "] Done!")
 
 def check_for_rebalance_suggestions():
-    """Check if ML model has suggested any rebalancing operations"""
+    """Check for rebalance suggestions from the ML model"""
     try:
-        response = requests.get('http://localhost:5000/api/get_suggestions', timeout=1)
+        response = requests.get("http://localhost:5050/api/suggestions", timeout=1)  # Changed from 5000 to 5050
         if response.status_code == 200:
-            suggestions = response.json()
-            if suggestions:
-                print("\n🤖 ML MODEL SUGGESTIONS:")
-                for suggestion in suggestions:
-                    print(f"  - Rebalance {suggestion['from_node']} -> {suggestion['to_node']} ({suggestion['amount']} sats)")
-                    # Optionally implement the suggestion
-                return suggestions
+            return response.json()
     except Exception as e:
-        print(f"Failed to get ML model suggestions: {e}")
+        print(f"Error getting rebalance suggestions: {e}")
     return []
+
+def rebalance_channel(sender, receiver, amount):
+    """Perform a rebalancing payment between two nodes"""
+    if not sender or not receiver:
+        print(f"  ❌ Invalid nodes for rebalancing: {sender} -> {receiver}")
+        return False
+        
+    try:
+        # Create an invoice on the receiver
+        invoice_cmd = f"docker exec {receiver} lncli --network=regtest addinvoice --amt={amount} --memo=\"Rebalance\""
+        invoice_result = json.loads(run_command(invoice_cmd))
+        payment_request = invoice_result.get("payment_request", "")
+        
+        if not payment_request:
+            print(f"  ❌ Failed to create invoice on {receiver}")
+            return False
+        
+        # Pay the invoice from the sender
+        payment_cmd = f"docker exec {sender} lncli --network=regtest payinvoice --force {payment_request}"
+        payment_result = run_command(payment_cmd)
+        
+        if not payment_result:
+            print(f"  ❌ Payment command failed")
+            return False
+            
+        try:
+            payment_json = json.loads(payment_result)
+            if "payment_error" in payment_json and payment_json["payment_error"]:
+                print(f"  ❌ Payment failed: {payment_json['payment_error']}")
+                return False
+                
+            print(f"  ✅ Rebalancing successful!")
+            stats["rebalance_operations"] += 1
+            stats["rebalance_successes"] += 1
+            
+            # Log the rebalance transaction
+            transaction = {
+                "timestamp": datetime.now().isoformat(),
+                "type": "rebalance",
+                "sender": sender,
+                "receiver": receiver,
+                "amount": amount,
+                "fee": 0,
+                "route_length": 1,
+                "success": True,
+                "payment_hash": "",
+                "description": f"Auto-recovery rebalance",
+                "duration_ms": 0,
+                "channel_before": "",
+                "channel_after": ""
+            }
+            
+            # Get channel state after rebalancing
+            sender_channels = get_node_channels(sender)
+            receiver_channels = get_node_channels(receiver)
+            
+            # Add to transaction log
+            with open(CSV_OUTPUT, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow([
+                    transaction["timestamp"],
+                    transaction["type"],
+                    transaction["sender"],
+                    transaction["receiver"],
+                    transaction["amount"],
+                    transaction["fee"],
+                    transaction["route_length"],
+                    transaction["success"],
+                    transaction["payment_hash"],
+                    transaction["description"],
+                    transaction["duration_ms"],
+                    transaction["channel_before"],
+                    transaction["channel_after"]
+                ])
+            
+            # Send transaction data to HTTP API
+            send_transaction_data(sender, receiver, amount, True)
+            
+            # Send updated channel states
+            for node, channels_data in [(sender, sender_channels), (receiver, receiver_channels)]:
+                if isinstance(channels_data, dict) and "channels" in channels_data:
+                    for channel in channels_data["channels"]:
+                        if isinstance(channel, dict):
+                            remote_pubkey = channel.get("remote_pubkey", "")
+                            capacity = int(channel.get("capacity", 0))
+                            local_balance = int(channel.get("local_balance", 0))
+                            if remote_pubkey and capacity > 0:
+                                send_channel_state(node, remote_pubkey, capacity, local_balance)
+            
+            return True
+        except json.JSONDecodeError:
+            # Check if the output contains "SUCCEEDED"
+            if "SUCCEEDED" in payment_result:
+                print(f"  ✅ Rebalancing successful!")
+                stats["rebalance_operations"] += 1
+                stats["rebalance_successes"] += 1
+                return True
+            else:
+                print(f"  ❌ Payment failed with non-JSON response")
+                print(f"  Response: {payment_result[:100]}...")
+                return False
+    except Exception as e:
+        print(f"  ❌ Rebalancing error: {e}")
+        return False
+
+def send_transaction_data(sender, receiver, amount, success):
+    """Send transaction data to the HTTP API using the feature adapter"""
+    data = {
+        "event_type": "transaction",
+        "timestamp": datetime.now().isoformat(),
+        "sender": sender,
+        "receiver": receiver,
+        "amount": amount,
+        "success": success,
+        "transaction_type": "payment"  # Add transaction type
+    }
+    
+    # Use the feature adapter
+    try:
+        # Use direct import or sys.path modification
+        import sys
+        import os
+        
+        # Get the current directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(current_dir)
+        
+        # Add the parent directory to sys.path if needed
+        if parent_dir not in sys.path:
+            sys.path.append(parent_dir)
+        
+        # Now import the feature adapter
+        import feature_adapter
+        feature_adapter.send_to_server(data)
+        print(f"  ✅ Transaction data sent via feature adapter")
+    except Exception as e:
+        print(f"  ⚠️ Error using feature adapter: {str(e)}")
+        
+        # Fallback to direct HTTP call
+        try:
+            response = requests.post("http://localhost:5050/api/update", json=data, timeout=1)  # Changed from 5000 to 5050
+            if response.status_code == 200:
+                print(f"  ✅ Transaction data sent directly to HTTP API")
+            else:
+                print(f"  ⚠️ HTTP API returned status code: {response.status_code}")
+        except Exception as e:
+            print(f"  ⚠️ Error sending transaction data to HTTP API: {str(e)}")
+
+def send_channel_state(node, remote_pubkey, capacity, local_balance):
+    """Send channel state data to the HTTP API using the feature adapter"""
+    data = {
+        "event_type": "channel_state",
+        "node": node,
+        "remote_pubkey": remote_pubkey,
+        "capacity": capacity,
+        "local_balance": local_balance,
+        "remote_balance": capacity - local_balance,
+        "timestamp": datetime.now().isoformat(),
+        "channel_id": f"{node}_{remote_pubkey[:8]}",
+        "balance_ratio": local_balance / capacity if capacity > 0 else 0.0
+    }
+    
+    # Use the feature adapter
+    try:
+        # Use direct import or sys.path modification
+        import sys
+        import os
+        
+        # Get the current directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(current_dir)
+        
+        # Add the parent directory to sys.path if needed
+        if parent_dir not in sys.path:
+            sys.path.append(parent_dir)
+        
+        # Now import the feature adapter
+        import feature_adapter
+        feature_adapter.send_to_server(data)
+        print(f"  ✅ Channel state data sent via feature adapter")
+    except Exception as e:
+        print(f"  ⚠️ Error using feature adapter: {str(e)}")
+        traceback.print_exc()  # Print the full stack trace
+        
+        # Fallback to direct HTTP call
+        try:
+            response = requests.post("http://localhost:5050/api/update", json=data, timeout=1)  # Changed from 5000 to 5050
+            if response.status_code == 200:
+                print(f"  ✅ Channel state data sent directly to HTTP API")
+            else:
+                print(f"  ⚠️ HTTP API returned status code: {response.status_code}")
+        except Exception as e:
+            print(f"  ⚠️ Error sending channel state data to HTTP API: {str(e)}")
+
+def capture_network_snapshot():
+    """Capture and send a complete snapshot of all channels in the network"""
+    print("\nCapturing network snapshot...")
+    
+    for node in NODES:
+        channels_data = get_node_channels(node)
+        if not isinstance(channels_data, dict):
+            continue
+            
+        channels = channels_data.get("channels", [])
+        if not channels:
+            continue
+            
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+                
+            remote_pubkey = channel.get("remote_pubkey", "")
+            capacity = int(channel.get("capacity", 0))
+            local_balance = int(channel.get("local_balance", 0))
+            
+            if remote_pubkey and capacity > 0:
+                # Send detailed channel state
+                send_channel_state(node, remote_pubkey, capacity, local_balance)
+    
+    print("Network snapshot complete")
+
+def sum_channel_balances(channels_data):
+    """Sum the local balances of all channels"""
+    total = 0
+    if isinstance(channels_data, dict):
+        for channel_id, channel in channels_data.items():
+            if isinstance(channel, dict):
+                total += int(channel.get("local_balance", 0))
+    return total
+
+def check_node_health():
+    """Check the health of all nodes and attempt recovery if needed"""
+    print("\nPerforming node health check...")
+    
+    for node in NODES:
+        print(f"Checking {node}...")
+        
+        # Check if node is responsive
+        result = run_command(f"docker exec {node} lncli --network=regtest getinfo", timeout=5)
+        
+        if result is None:
+            print(f"⚠️ {node} appears to be unresponsive. Attempting recovery...")
+            
+            # Try to unlock wallet using our new function
+            if unlock_wallet(node):
+                print(f"✅ {node} recovered successfully")
+            else:
+                print(f"❌ {node} is still unresponsive after recovery attempt")
+                
+                # Try restarting the node as a last resort
+                print(f"Attempting to restart {node}...")
+                subprocess.run(f"docker restart {node}", shell=True, timeout=30)
+                print(f"Waiting for {node} to initialize...")
+                time.sleep(15)
+                
+                # Try unlocking again after restart
+                if unlock_wallet(node):
+                    print(f"✅ {node} recovered successfully after restart")
+                else:
+                    print(f"❌ {node} is still unresponsive after restart")
+        else:
+            print(f"✅ {node} is healthy")
+    
+    print("Node health check complete")
+
+def unlock_wallet(node):
+    """Unlock a node's wallet using expect script"""
+    print(f"🔑 Unlocking wallet for {node}...")
+    
+    # Create expect script - note the double curly braces for expect script
+    unlock_cmd = f"""
+    expect -c '
+    set timeout 30
+    spawn docker exec -it {node} lncli --network=regtest unlock
+    expect "Input wallet password: "
+    send "password\\r"
+    expect {{
+        "lnd successfully unlocked!" {{ exit 0 }}
+        timeout {{ exit 1 }}
+        eof {{ exit 2 }}
+    }}
+    '
+    """
+    
+    # Run the unlock command
+    result = subprocess.run(unlock_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    
+    # Wait for wallet to initialize
+    print(f"Waiting for {node} to initialize after unlock...")
+    time.sleep(10)
+    
+    # Verify wallet is unlocked
+    verify_cmd = f"docker exec {node} lncli --network=regtest getinfo"
+    verify_result = subprocess.run(verify_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    
+    if verify_result.returncode == 0:
+        print(f"✅ {node} wallet successfully unlocked")
+        return True
+    else:
+        print(f"❌ Failed to unlock {node} wallet: {verify_result.stderr}")
+        return False
+
+def keep_wallets_unlocked():
+    """Proactively check and unlock all node wallets"""
+    print("\nProactively checking wallet status...")
+    
+    for node in NODES:
+        # Check if wallet is locked
+        check_cmd = f"docker exec {node} lncli --network=regtest getinfo"
+        result = subprocess.run(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0 and "wallet locked" in result.stderr:
+            print(f"🔒 {node} wallet is locked. Unlocking...")
+            unlock_wallet(node)
+        else:
+            print(f"✓ {node} wallet is already unlocked")
+    
+    print("Wallet check complete")
 
 def main():
     """Main simulation function"""
@@ -1000,6 +1573,17 @@ def main():
         last_snapshot_time = time.time()
         SNAPSHOT_INTERVAL = 300  # Take a snapshot every 5 minutes
         
+        # Add health check timer
+        last_health_check = time.time()
+        HEALTH_CHECK_INTERVAL = 300  # Check node health every 5 minutes
+        
+        # Add wallet unlock timer
+        last_wallet_check = time.time()
+        WALLET_CHECK_INTERVAL = 120  # Check wallets every 2 minutes
+        
+        # Initial wallet check
+        keep_wallets_unlocked()
+        
         while time.time() < end_time:
             try:
                 # Check if we need regular rebalancing
@@ -1008,6 +1592,22 @@ def main():
                     if rebalance_count >= REBALANCE_FREQUENCY:
                         rebalance_channels()
                         rebalance_count = 0
+                
+                # Check if it's time for a network snapshot
+                current_time = time.time()
+                if current_time - last_snapshot_time >= SNAPSHOT_INTERVAL:
+                    capture_network_snapshot()
+                    last_snapshot_time = current_time
+                
+                # Check if it's time for a node health check
+                if current_time - last_health_check >= HEALTH_CHECK_INTERVAL:
+                    check_node_health()
+                    last_health_check = current_time
+                
+                # Check if it's time for a wallet check
+                if current_time - last_wallet_check >= WALLET_CHECK_INTERVAL:
+                    keep_wallets_unlocked()
+                    last_wallet_check = current_time
                 
                 # Simulate a transaction
                 transaction = simulate_transaction()
@@ -1041,12 +1641,6 @@ def main():
                         except Exception as e:
                             print(f"Error checking channel balances: {e}")
                 
-                # Check if it's time for a channel snapshot
-                current_time = time.time()
-                if current_time - last_snapshot_time >= SNAPSHOT_INTERVAL:
-                    log_channel_snapshot()
-                    last_snapshot_time = current_time
-                
                 # Print statistics every 10 transactions
                 if transaction_count % 10 == 0 and transaction_count > 0:
                     print_statistics()
@@ -1065,6 +1659,8 @@ def main():
                 time.sleep(delay)
             except Exception as e:
                 print(f"Error during simulation: {e}")
+                print("Detailed error information:")
+                traceback.print_exc()
                 time.sleep(5)  # Wait a bit before trying again
     
     # Final statistics
